@@ -775,7 +775,8 @@ fn lark_mime_for_path(path: &str) -> &'static str {
 fn lark_file_type_for_ext(ext: &str) -> &'static str {
     match ext {
         "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" => "image",
-        "opus" | "amr" | "mp3" | "wav" | "m4a" => "opus",
+        "opus" | "amr" => "opus",
+        "mp3" | "wav" | "m4a" => "stream",
         "mp4" | "avi" | "mov" | "mkv" => "mp4",
         "pdf" => "pdf",
         "doc" | "docx" => "doc",
@@ -802,7 +803,7 @@ pub async fn send_media_message(config: &Config, chat_id: &str, file_path: &str)
 
     let (msg_type, content) = if is_image {
         ("image", serde_json::json!({ "image_key": key }).to_string())
-    } else if matches!(ext.as_str(), "opus" | "amr" | "mp3" | "wav" | "m4a") {
+    } else if matches!(ext.as_str(), "opus" | "amr") {
         ("audio", serde_json::json!({ "file_key": key }).to_string())
     } else if matches!(ext.as_str(), "mp4" | "avi" | "mov" | "mkv") {
         ("media", serde_json::json!({ "file_key": key }).to_string())
@@ -822,6 +823,7 @@ pub async fn send_media_message(config: &Config, chat_id: &str, file_path: &str)
         .build()
         .map_err(|e| Error::Channel(format!("Failed to build HTTP client: {}", e)))?;
 
+    info!(chat_id = %chat_id, msg_type = %msg_type, "Lark: sending media message");
     let response = client
         .post(format!("{}/im/v1/messages?receive_id_type=chat_id", LARK_OPEN_API))
         .header("Authorization", format!("Bearer {}", token))
@@ -834,11 +836,23 @@ pub async fn send_media_message(config: &Config, chat_id: &str, file_path: &str)
         .await
         .map_err(|e| Error::Channel(format!("Lark send_media_message request failed: {}", e)))?;
 
-    if !response.status().is_success() {
+    let status = response.status();
+    if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(Error::Channel(format!("Lark API send media error: {}", body)));
+        return Err(Error::Channel(format!("Lark API send media HTTP error {}: {}", status, body)));
     }
 
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| Error::Channel(format!("Lark send media response parse failed: {}", e)))?;
+    let code = body.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+    if code != 0 {
+        let msg = body.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown");
+        return Err(Error::Channel(format!("Lark API send media error code {}: {}", code, msg)));
+    }
+
+    info!(chat_id = %chat_id, msg_type = %msg_type, "Lark: media message sent");
     Ok(())
 }
 
