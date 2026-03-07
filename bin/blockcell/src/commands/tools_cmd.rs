@@ -176,6 +176,7 @@ pub async fn test(tool_name: &str, params_json: &str) -> anyhow::Result<()> {
         memory_store: None,
         capability_registry: None,
         core_evolution: None,
+        event_emitter: None,
         channel_contacts_file: Some(paths.channel_contacts_file()),
     };
 

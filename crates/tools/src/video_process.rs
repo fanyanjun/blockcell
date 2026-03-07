@@ -821,6 +821,7 @@ mod tests {
             spawn_handle: None,
             capability_registry: None,
             core_evolution: None,
+            event_emitter: None,
             channel_contacts_file: None,
         };
         assert_eq!(

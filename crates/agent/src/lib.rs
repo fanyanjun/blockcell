@@ -5,6 +5,9 @@ pub mod health;
 pub mod intent;
 pub mod memory_adapter;
 pub mod runtime;
+pub mod summary_queue;
+pub mod system_event_orchestrator;
+pub mod system_event_store;
 pub mod task_manager;
 
 pub use bus::MessageBus;

@@ -1,10 +1,11 @@
 use async_trait::async_trait;
-use blockcell_tools::TaskManagerOps;
+use blockcell_core::system_event::{DeliveryPolicy, EventPriority, SystemEvent};
+use blockcell_tools::{EventEmitterHandle, TaskManagerOps};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
 /// Status of a background task.
@@ -57,19 +58,113 @@ pub struct TaskInfo {
     pub origin_chat_id: String,
     /// Agent that owns this task. Missing values are treated as the default agent.
     pub agent_id: Option<String>,
+    #[serde(default)]
+    emit_system_events: bool,
 }
 
 /// Thread-safe task registry for tracking background subagent tasks.
 #[derive(Clone)]
 pub struct TaskManager {
     tasks: Arc<Mutex<HashMap<String, TaskInfo>>>,
+    event_emitters: Arc<StdMutex<HashMap<String, EventEmitterHandle>>>,
+}
+
+fn normalized_agent_key(agent_id: Option<&str>) -> String {
+    agent_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("default")
+        .to_string()
 }
 
 impl TaskManager {
     pub fn new() -> Self {
         Self {
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            event_emitters: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    pub fn register_event_emitter(&self, agent_id: Option<&str>, emitter: EventEmitterHandle) {
+        let mut emitters = self
+            .event_emitters
+            .lock()
+            .expect("task manager event emitter lock poisoned");
+        emitters.insert(normalized_agent_key(agent_id), emitter);
+    }
+
+    fn event_emitter_for_agent(&self, agent_id: Option<&str>) -> Option<EventEmitterHandle> {
+        let emitters = self
+            .event_emitters
+            .lock()
+            .expect("task manager event emitter lock poisoned");
+        emitters
+            .get(&normalized_agent_key(agent_id))
+            .cloned()
+            .or_else(|| emitters.get("default").cloned())
+    }
+
+    fn emit_lifecycle_event(&self, task: &TaskInfo, phase: &str) {
+        if !task.emit_system_events {
+            return;
+        }
+
+        let Some(emitter) = self.event_emitter_for_agent(task.agent_id.as_deref()) else {
+            return;
+        };
+
+        let (priority, title, summary, delivery) = match phase {
+            "created" => (
+                EventPriority::Normal,
+                "后台任务已创建".to_string(),
+                format!("{} 已加入后台队列", task.label),
+                DeliveryPolicy::default(),
+            ),
+            "running" => (
+                EventPriority::Normal,
+                "后台任务开始执行".to_string(),
+                format!("{} 正在后台执行", task.label),
+                DeliveryPolicy::default(),
+            ),
+            "completed" => (
+                EventPriority::Normal,
+                "后台任务已完成".to_string(),
+                task.result
+                    .as_ref()
+                    .map(|result| format!("{} 已完成：{}", task.label, result))
+                    .unwrap_or_else(|| format!("{} 已完成", task.label)),
+                DeliveryPolicy::default(),
+            ),
+            "failed" => (
+                EventPriority::Critical,
+                "后台任务失败".to_string(),
+                task.error
+                    .as_ref()
+                    .map(|error| format!("{} 执行失败：{}", task.label, error))
+                    .unwrap_or_else(|| format!("{} 执行失败", task.label)),
+                DeliveryPolicy::critical(),
+            ),
+            _ => return,
+        };
+
+        let mut event = SystemEvent::new_main_session(
+            format!("task.{}", phase),
+            "task_manager",
+            priority,
+            title,
+            summary,
+        );
+        event.delivery = delivery;
+        event.dedup_key = Some(format!("task:{}", task.id));
+        event.details = json!({
+            "task_id": task.id.clone(),
+            "label": task.label.clone(),
+            "status": task.status.to_string(),
+            "origin_channel": task.origin_channel.clone(),
+            "origin_chat_id": task.origin_chat_id.clone(),
+            "agent_id": task.agent_id.clone(),
+        });
+        emitter.emit(event);
     }
 
     /// Register a new task and return its ID.
@@ -81,6 +176,7 @@ impl TaskManager {
         origin_channel: &str,
         origin_chat_id: &str,
         agent_id: Option<&str>,
+        emit_system_events: bool,
     ) -> TaskInfo {
         let info = TaskInfo {
             id: task_id.to_string(),
@@ -96,22 +192,31 @@ impl TaskManager {
             origin_channel: origin_channel.to_string(),
             origin_chat_id: origin_chat_id.to_string(),
             agent_id: agent_id.map(str::to_string),
+            emit_system_events,
         };
         {
             let mut tasks = self.tasks.lock().await;
             tasks.insert(task_id.to_string(), info.clone());
         }
+        self.emit_lifecycle_event(&info, "created");
         info
     }
 
     /// Mark a task as running.
     pub async fn set_running(&self, task_id: &str) {
-        {
+        let updated = {
             let mut tasks = self.tasks.lock().await;
             if let Some(task) = tasks.get_mut(task_id) {
                 task.status = TaskStatus::Running;
                 task.started_at = Some(Utc::now());
+                Some(task.clone())
+            } else {
+                None
             }
+        };
+
+        if let Some(task) = updated {
+            self.emit_lifecycle_event(&task, "running");
         }
     }
 
@@ -127,7 +232,7 @@ impl TaskManager {
 
     /// Mark a task as completed with a result summary.
     pub async fn set_completed(&self, task_id: &str, result: &str) {
-        {
+        let updated = {
             let mut tasks = self.tasks.lock().await;
             if let Some(task) = tasks.get_mut(task_id) {
                 task.status = TaskStatus::Completed;
@@ -143,19 +248,33 @@ impl TaskManager {
                     result.to_string()
                 };
                 task.result = Some(truncated);
+                Some(task.clone())
+            } else {
+                None
             }
+        };
+
+        if let Some(task) = updated {
+            self.emit_lifecycle_event(&task, "completed");
         }
     }
 
     /// Mark a task as failed with an error message.
     pub async fn set_failed(&self, task_id: &str, error: &str) {
-        {
+        let updated = {
             let mut tasks = self.tasks.lock().await;
             if let Some(task) = tasks.get_mut(task_id) {
                 task.status = TaskStatus::Failed;
                 task.completed_at = Some(Utc::now());
                 task.error = Some(error.to_string());
+                Some(task.clone())
+            } else {
+                None
             }
+        };
+
+        if let Some(task) = updated {
+            self.emit_lifecycle_event(&task, "failed");
         }
     }
 
@@ -300,7 +419,6 @@ impl TaskManagerOps for TaskManager {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,12 +434,95 @@ mod tests {
                 "cli",
                 "chat-1",
                 Some("ops"),
+                false,
             )
             .await;
 
         let tasks = manager.list_tasks(None).await;
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].agent_id.as_deref(), Some("ops"));
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingEmitter {
+        events: Arc<StdMutex<Vec<SystemEvent>>>,
+    }
+
+    impl RecordingEmitter {
+        fn handle(&self) -> EventEmitterHandle {
+            Arc::new(self.clone())
+        }
+
+        fn kinds(&self) -> Vec<String> {
+            self.events
+                .lock()
+                .expect("task manager recording emitter lock poisoned")
+                .iter()
+                .map(|event| event.kind.clone())
+                .collect()
+        }
+    }
+
+    impl blockcell_tools::SystemEventEmitter for RecordingEmitter {
+        fn emit(&self, event: SystemEvent) {
+            self.events
+                .lock()
+                .expect("task manager recording emitter lock poisoned")
+                .push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_task_manager_event_emits_lifecycle_updates() {
+        let manager = TaskManager::new();
+        let emitter = RecordingEmitter::default();
+        manager.register_event_emitter(Some("ops"), emitter.handle());
+
+        manager
+            .create_task(
+                "task-1",
+                "demo",
+                "do something",
+                "cli",
+                "chat-1",
+                Some("ops"),
+                true,
+            )
+            .await;
+        manager.set_running("task-1").await;
+        manager.set_completed("task-1", "done").await;
+
+        assert_eq!(
+            emitter.kinds(),
+            vec![
+                "task.created".to_string(),
+                "task.running".to_string(),
+                "task.completed".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_manager_event_skips_non_notifying_tasks() {
+        let manager = TaskManager::new();
+        let emitter = RecordingEmitter::default();
+        manager.register_event_emitter(Some("ops"), emitter.handle());
+
+        manager
+            .create_task(
+                "task-1",
+                "demo",
+                "do something",
+                "cli",
+                "chat-1",
+                Some("ops"),
+                false,
+            )
+            .await;
+        manager.set_running("task-1").await;
+        manager.set_failed("task-1", "boom").await;
+
+        assert!(emitter.kinds().is_empty());
     }
 
     #[tokio::test]
@@ -335,6 +536,7 @@ mod tests {
                 "cli",
                 "chat-1",
                 Some("ops"),
+                false,
             )
             .await;
 

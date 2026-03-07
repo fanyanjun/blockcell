@@ -67,6 +67,33 @@ blockcell 选择了 Rust。
 
 ---
 
+## 当前版本补充：SystemEventOrchestrator 与后台主动汇报
+
+blockcell 现在多了一条结构化的后台事件链路，用来承接“系统在后台做了什么，何时该主动告诉用户”：
+
+- `HeartbeatService` 仍然只是**定时 Prompt 注入器**
+  - 它继续读取 `HEARTBEAT.md` 并向 Agent 投递内部消息
+  - 它**不负责**事件聚合、摘要合并、主动通知编排
+- `AgentRuntime::run_loop` 的 `tick_interval` 分支里新增了 `SystemEventOrchestrator` 调用
+  - 负责读取 `system_event store`
+  - 将 `Critical` 事件转成即时通知
+  - 将 `Normal` 事件压入 `main session summary queue`
+  - 在到达阈值或等待超时后，统一渲染为简洁摘要并投递
+- Phase 1 只接入两个 producer：
+  - `TaskManager`：后台子任务生命周期事件（`task.created / running / completed / failed`）
+  - `CronService`：定时任务派发生命周期事件（`cron.job_started / completed / failed`）
+
+当前限制也需要明确：
+
+- 只支持 `MainSession` 汇总与投递
+- 事件存储与摘要队列都还是**进程内内存**，重启后不会恢复
+- 主会话目标通过“每个 agent 最近一次交互式入站消息”记忆
+- 若当前 agent 还没有主会话目标，事件仍会被记录，但不会强行外发
+
+这意味着 blockcell 的“主动性”已经开始从某个 prompt/agent 的临时判断，下沉为平台级基础设施。
+
+---
+
 ## Crate 结构
 
 blockcell 是一个 Cargo workspace，由 9 个 crate 组成：

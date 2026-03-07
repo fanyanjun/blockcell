@@ -1,8 +1,10 @@
 use crate::job::{CronJob, ScheduleKind};
+use blockcell_core::system_event::{DeliveryPolicy, EventPriority, SystemEvent};
 use blockcell_core::{InboundMessage, Paths, Result};
+use blockcell_tools::EventEmitterHandle;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info};
 
@@ -26,6 +28,7 @@ pub struct CronService {
     jobs: Arc<RwLock<Vec<CronJob>>>,
     inbound_tx: mpsc::Sender<InboundMessage>,
     agent_id: Option<String>,
+    event_emitter: Arc<StdMutex<Option<EventEmitterHandle>>>,
 }
 
 fn apply_route_agent_id(metadata: &mut serde_json::Value, agent_id: Option<&str>) {
@@ -56,7 +59,49 @@ impl CronService {
             agent_id: agent_id
                 .map(|id| id.trim().to_string())
                 .filter(|id| !id.is_empty()),
+            event_emitter: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    pub fn set_event_emitter(&self, emitter: EventEmitterHandle) {
+        let mut slot = self
+            .event_emitter
+            .lock()
+            .expect("cron service event emitter lock poisoned");
+        *slot = Some(emitter);
+    }
+
+    fn emit_system_event(&self, event: SystemEvent) {
+        let emitter = self
+            .event_emitter
+            .lock()
+            .expect("cron service event emitter lock poisoned")
+            .clone();
+        if let Some(emitter) = emitter {
+            emitter.emit(event);
+        }
+    }
+
+    fn emit_cron_event(
+        &self,
+        job: &CronJob,
+        kind: &str,
+        priority: EventPriority,
+        title: &str,
+        summary: String,
+        delivery: DeliveryPolicy,
+    ) {
+        let mut event = SystemEvent::new_main_session(kind, "cron", priority, title, summary);
+        event.delivery = delivery;
+        event.details = serde_json::json!({
+            "job_id": job.id.clone(),
+            "job_name": job.name.clone(),
+            "payload_kind": job.payload.kind.clone(),
+            "deliver": job.payload.deliver,
+            "deliver_channel": job.payload.channel.clone(),
+            "deliver_to": job.payload.to.clone(),
+        });
+        self.emit_system_event(event);
     }
 
     pub async fn load(&self) -> Result<()> {
@@ -291,6 +336,14 @@ impl CronService {
 
     async fn execute_job(&self, job: &CronJob) {
         debug!(job_id = %job.id, job_name = %job.name, kind = %job.payload.kind, "Executing cron job");
+        self.emit_cron_event(
+            job,
+            "cron.job_started",
+            EventPriority::Normal,
+            "定时任务开始执行",
+            format!("定时任务 {} 已开始执行", job.name),
+            DeliveryPolicy::default(),
+        );
 
         let script_kind = match job.payload.kind.as_str() {
             "skill_rhai" => Some("rhai"),
@@ -379,6 +432,23 @@ impl CronService {
 
         if let Err(e) = self.inbound_tx.send(msg).await {
             error!(error = %e, "Failed to send cron job message");
+            self.emit_cron_event(
+                job,
+                "cron.job_failed",
+                EventPriority::Critical,
+                "定时任务派发失败",
+                format!("定时任务 {} 派发失败：{}", job.name, e),
+                DeliveryPolicy::critical(),
+            );
+        } else {
+            self.emit_cron_event(
+                job,
+                "cron.job_completed",
+                EventPriority::Normal,
+                "定时任务已派发",
+                format!("定时任务 {} 已成功派发", job.name),
+                DeliveryPolicy::default(),
+            );
         }
     }
 
@@ -407,6 +477,72 @@ impl CronService {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Default)]
+    struct RecordingEmitter {
+        events: Arc<StdMutex<Vec<SystemEvent>>>,
+    }
+
+    impl RecordingEmitter {
+        fn handle(&self) -> EventEmitterHandle {
+            Arc::new(self.clone())
+        }
+
+        fn kinds(&self) -> Vec<String> {
+            self.events
+                .lock()
+                .expect("recording emitter lock poisoned")
+                .iter()
+                .map(|event| event.kind.clone())
+                .collect()
+        }
+
+        fn priorities(&self) -> Vec<EventPriority> {
+            self.events
+                .lock()
+                .expect("recording emitter lock poisoned")
+                .iter()
+                .map(|event| event.priority)
+                .collect()
+        }
+    }
+
+    impl blockcell_tools::SystemEventEmitter for RecordingEmitter {
+        fn emit(&self, event: SystemEvent) {
+            self.events
+                .lock()
+                .expect("recording emitter lock poisoned")
+                .push(event);
+        }
+    }
+
+    fn test_job() -> CronJob {
+        let now_ms = Utc::now().timestamp_millis();
+        CronJob {
+            id: "job-1".to_string(),
+            name: "daily sync".to_string(),
+            enabled: true,
+            schedule: crate::job::JobSchedule {
+                kind: ScheduleKind::Every,
+                at_ms: None,
+                every_ms: Some(60_000),
+                expr: None,
+                tz: None,
+            },
+            payload: crate::job::JobPayload {
+                kind: "agent_turn".to_string(),
+                message: "sync status".to_string(),
+                deliver: false,
+                channel: None,
+                to: None,
+                skill_name: None,
+            },
+            state: crate::job::JobState::default(),
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            delete_after_run: false,
+        }
+    }
+
     #[test]
     fn test_apply_route_agent_id_inserts_metadata() {
         let mut metadata = serde_json::json!({"job_id":"1"});
@@ -422,5 +558,54 @@ mod tests {
         let mut metadata = serde_json::json!({"job_id":"1"});
         apply_route_agent_id(&mut metadata, Some("   "));
         assert!(metadata.get("route_agent_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cron_event_execute_job_emits_started_and_completed() {
+        let paths = Paths::with_base(
+            std::env::temp_dir().join(format!("blockcell-cron-service-{}", uuid::Uuid::new_v4())),
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        let service = CronService::new(paths, tx);
+        let emitter = RecordingEmitter::default();
+        service.set_event_emitter(emitter.handle());
+
+        service.execute_job(&test_job()).await;
+
+        let message = rx.recv().await.expect("receive cron inbound message");
+        assert_eq!(message.sender_id, "cron");
+        assert_eq!(
+            emitter.kinds(),
+            vec![
+                "cron.job_started".to_string(),
+                "cron.job_completed".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cron_event_execute_job_emits_failed_on_send_error() {
+        let paths = Paths::with_base(
+            std::env::temp_dir().join(format!("blockcell-cron-service-{}", uuid::Uuid::new_v4())),
+        );
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let service = CronService::new(paths, tx);
+        let emitter = RecordingEmitter::default();
+        service.set_event_emitter(emitter.handle());
+
+        service.execute_job(&test_job()).await;
+
+        assert_eq!(
+            emitter.kinds(),
+            vec![
+                "cron.job_started".to_string(),
+                "cron.job_failed".to_string(),
+            ]
+        );
+        assert_eq!(
+            emitter.priorities().last().copied(),
+            Some(EventPriority::Critical)
+        );
     }
 }

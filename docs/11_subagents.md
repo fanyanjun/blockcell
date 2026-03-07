@@ -251,6 +251,8 @@ struct TaskInfo {
 
 任务完成后，结果通过 `outbound_tx` 发送回原始渠道（CLI、Telegram、Slack 等）。
 
+补充说明：当前版本虽然仍用 `TaskManager` 统一管理普通消息任务与子智能体任务，但只有**真正的后台子任务**会发出 `system_event` 并进入主会话摘要队列。普通对话消息对应的内部运行任务仅用于并发控制与取消，不会主动打扰用户。
+
 ---
 
 ## 与 Gateway 模式结合

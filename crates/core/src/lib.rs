@@ -4,6 +4,7 @@ pub mod error;
 pub mod mcp_config;
 pub mod message;
 pub mod paths;
+pub mod system_event;
 pub mod types;
 
 pub use capability::{
