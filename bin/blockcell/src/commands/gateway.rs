@@ -28,7 +28,8 @@ use blockcell_storage::{MemoryStore, SessionStore};
 use blockcell_tools::mcp::manager::McpManager;
 use blockcell_tools::{
     build_tool_registry_for_agent_config, build_tool_registry_with_all_mcp,
-    CapabilityRegistryHandle, CoreEvolutionHandle, MemoryStoreHandle, ToolRegistry,
+    CapabilityRegistryHandle, CoreEvolutionHandle, EventEmitterHandle, MemoryStoreHandle,
+    ToolRegistry,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -609,6 +610,7 @@ async fn spawn_agent_runtime(
     mpsc::Sender<InboundMessage>,
     tokio::task::JoinHandle<()>,
     Option<MemoryStoreHandle>,
+    EventEmitterHandle,
 )> {
     let agent_config = config
         .config_for_agent(agent_id)
@@ -683,6 +685,7 @@ async fn spawn_agent_runtime(
     runtime.set_capability_registry(cap_registry_handle);
     runtime.set_core_evolution(core_evo_handle);
     runtime.set_event_tx(ws_broadcast_tx);
+    let event_emitter = runtime.event_emitter_handle();
 
     let (agent_inbound_tx, agent_inbound_rx) = mpsc::channel::<InboundMessage>(100);
     let runtime_shutdown_rx = shutdown_tx.subscribe();
@@ -692,7 +695,12 @@ async fn spawn_agent_runtime(
             .await;
     });
 
-    Ok((agent_inbound_tx, runtime_handle, memory_store_handle))
+    Ok((
+        agent_inbound_tx,
+        runtime_handle,
+        memory_store_handle,
+        event_emitter,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -959,9 +967,10 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     let mut runtime_senders: HashMap<String, mpsc::Sender<InboundMessage>> = HashMap::new();
     let mut runtime_handles: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut agent_memory_stores: HashMap<String, MemoryStoreHandle> = HashMap::new();
+    let mut agent_event_emitters: HashMap<String, EventEmitterHandle> = HashMap::new();
     for agent in &resolved_agents {
         let agent_id = agent.id.clone();
-        let (agent_tx, agent_handle, memory_store_handle) = spawn_agent_runtime(
+        let (agent_tx, agent_handle, memory_store_handle, event_emitter) = spawn_agent_runtime(
             &config,
             &paths,
             Arc::clone(&mcp_manager),
@@ -976,6 +985,8 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         if let Some(memory_store_handle) = memory_store_handle {
             agent_memory_stores.insert(agent_id.clone(), memory_store_handle);
         }
+        task_manager.register_event_emitter(Some(&agent_id), event_emitter.clone());
+        agent_event_emitters.insert(agent_id.clone(), event_emitter);
         runtime_senders.insert(agent_id.clone(), agent_tx);
         runtime_handles.push((format!("runtime:{}", agent_id), agent_handle));
     }
@@ -998,6 +1009,9 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
                 Some(agent_id.clone())
             },
         ));
+        if let Some(emitter) = agent_event_emitters.get(&agent_id) {
+            cron_service.set_event_emitter(emitter.clone());
+        }
         cron_service.load().await?;
         let shutdown_rx = shutdown_tx.subscribe();
         let cron = cron_service.clone();

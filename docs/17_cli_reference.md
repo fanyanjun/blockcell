@@ -226,6 +226,26 @@ blockcell mcp disable github
 
 ---
 
+## 后台事件与主动摘要（Phase 1）
+
+当前版本没有单独的 `system-event` CLI 子命令，但 `agent` / `gateway` 运行时已经默认启用后台事件编排：
+
+- `TaskManager` 会为后台子任务发出结构化事件
+- `CronService` 会为定时任务派发发出结构化事件
+- `AgentRuntime` 的 tick 会把这些事件聚合为：
+  - 即时通知（如关键失败）
+  - 主会话摘要（如任务完成、定时任务成功派发）
+
+使用要点：
+
+- 生效入口是 `blockcell agent` / `blockcell gateway` 进程本身，不需要额外命令开关
+- 升级到包含该特性的版本后，**重启进程即可生效**
+- 当前只支持每个 agent 的“最近活跃主会话”
+- 当前只做进程内内存聚合；进程重启后，未发出的摘要不会保留
+- 当前只接入 `TaskManager` 与 `CronService`，Ghost 还没有接入这一轮事件生产
+
+---
+
 ## status — 查看状态
 
 ```

@@ -1,10 +1,11 @@
+use blockcell_core::system_event::{EventPriority, EventScope, SessionSummary, SystemEvent};
 use blockcell_core::types::{ChatMessage, ToolCallRequest};
 use blockcell_core::{Config, InboundMessage, OutboundMessage, Paths, Result};
 use blockcell_providers::{CallResult, Provider, ProviderPool};
 use blockcell_storage::{AuditLogger, SessionStore};
 use blockcell_tools::{
-    CapabilityRegistryHandle, CoreEvolutionHandle, MemoryStoreHandle, SpawnHandle,
-    TaskManagerHandle, ToolRegistry,
+    CapabilityRegistryHandle, CoreEvolutionHandle, EventEmitterHandle, MemoryStoreHandle,
+    SpawnHandle, SystemEventEmitter, TaskManagerHandle, ToolRegistry,
 };
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -15,6 +16,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::context::{ActiveSkillContext, ContextBuilder, InteractionMode};
 use crate::intent::{IntentCategory, IntentToolResolver};
+use crate::summary_queue::MainSessionSummaryQueue;
+use crate::system_event_orchestrator::{
+    HeartbeatDecision, NotificationRequest, SystemEventOrchestrator,
+};
+use crate::system_event_store::{InMemorySystemEventStore, SystemEventStoreOps};
 use crate::task_manager::TaskManager;
 
 /// Adapter that wraps a Provider to implement the skills::LLMProvider trait.
@@ -48,6 +54,7 @@ pub struct RuntimeSpawnHandle {
     outbound_tx: Option<mpsc::Sender<OutboundMessage>>,
     provider_pool: Arc<ProviderPool>,
     agent_id: Option<String>,
+    event_emitter: EventEmitterHandle,
 }
 
 impl SpawnHandle for RuntimeSpawnHandle {
@@ -95,6 +102,7 @@ impl SpawnHandle for RuntimeSpawnHandle {
             origin_channel,
             origin_chat_id,
             agent_id,
+            self.event_emitter.clone(),
         ));
 
         Ok(serde_json::json!({
@@ -138,6 +146,62 @@ fn summarize_result(result: &str) -> String {
         result.to_string()
     } else {
         format!("{}... (truncated)", truncate_str(result, max_chars))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MainSessionTarget {
+    channel: String,
+    account_id: Option<String>,
+    chat_id: String,
+    session_key: String,
+}
+
+#[derive(Clone)]
+struct RuntimeSystemEventEmitter {
+    store: InMemorySystemEventStore,
+}
+
+impl SystemEventEmitter for RuntimeSystemEventEmitter {
+    fn emit(&self, event: SystemEvent) {
+        self.store.emit(event);
+    }
+}
+
+fn is_main_session_candidate(msg: &InboundMessage) -> bool {
+    if matches!(
+        msg.channel.as_str(),
+        "system" | "cron" | "subagent" | "ghost"
+    ) {
+        return false;
+    }
+    if matches!(msg.sender_id.as_str(), "system" | "cron") {
+        return false;
+    }
+    if msg
+        .metadata
+        .get("cancel")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    true
+}
+
+fn render_system_notification_text(request: &NotificationRequest) -> String {
+    match request.priority {
+        EventPriority::Critical => format!("🚨 {}\n{}", request.title, request.body),
+        EventPriority::High => format!("⚠️ {}\n{}", request.title, request.body),
+        _ => format!("ℹ️ {}\n{}", request.title, request.body),
+    }
+}
+
+fn render_session_summary_text(summary: &SessionSummary) -> String {
+    if summary.compact_text.trim().is_empty() {
+        summary.title.clone()
+    } else {
+        format!("🗂️ {}\n{}", summary.title, summary.compact_text)
     }
 }
 
@@ -638,6 +702,14 @@ pub struct AgentRuntime {
     core_evolution: Option<CoreEvolutionHandle>,
     /// Broadcast sender for streaming events to WebSocket clients (gateway mode).
     event_tx: Option<broadcast::Sender<String>>,
+    /// In-memory store for structured system events emitted by runtime producers.
+    system_event_store: InMemorySystemEventStore,
+    /// Tick orchestrator for system event delivery.
+    system_event_orchestrator: SystemEventOrchestrator,
+    /// Shared emitter handle used by tools, task manager, and schedulers.
+    system_event_emitter: EventEmitterHandle,
+    /// Last interactive main-session target for summary / notification delivery.
+    main_session_target: Option<MainSessionTarget>,
     /// Cooldown tracker: capability_id → last auto-request timestamp (epoch secs).
     /// Prevents repeated auto-triggering of the same capability within 24h.
     cap_request_cooldown: HashMap<String, i64>,
@@ -667,6 +739,16 @@ impl AgentRuntime {
         let session_store = SessionStore::new(paths.clone());
         let audit_logger = AuditLogger::new(paths.clone());
         let channel_contacts = blockcell_storage::ChannelContacts::new(paths.clone());
+        let system_event_store = InMemorySystemEventStore::default();
+        let summary_queue = MainSessionSummaryQueue::with_policy(
+            5,
+            config.tools.tick_interval_secs.clamp(10, 300) as i64 * 1000,
+        );
+        let system_event_orchestrator =
+            SystemEventOrchestrator::new(system_event_store.clone(), summary_queue.clone());
+        let system_event_emitter: EventEmitterHandle = Arc::new(RuntimeSystemEventEmitter {
+            store: system_event_store.clone(),
+        });
 
         Ok(Self {
             config,
@@ -686,6 +768,10 @@ impl AgentRuntime {
             capability_registry: None,
             core_evolution: None,
             event_tx: None,
+            system_event_store,
+            system_event_orchestrator,
+            system_event_emitter,
+            main_session_target: None,
             cap_request_cooldown: HashMap::new(),
             channel_contacts,
         })
@@ -711,15 +797,151 @@ impl AgentRuntime {
     /// Set a shared task manager (e.g. from the command layer).
     pub fn set_task_manager(&mut self, tm: TaskManager) {
         self.task_manager = tm;
+        self.sync_task_manager_event_emitter();
     }
 
     pub fn set_agent_id(&mut self, agent_id: Option<String>) {
         self.agent_id = agent_id;
+        self.sync_task_manager_event_emitter();
     }
 
     /// Set the broadcast sender for streaming events to WebSocket clients.
     pub fn set_event_tx(&mut self, tx: broadcast::Sender<String>) {
         self.event_tx = Some(tx);
+    }
+
+    pub fn set_event_emitter(&mut self, emitter: EventEmitterHandle) {
+        self.system_event_emitter = emitter;
+        self.sync_task_manager_event_emitter();
+    }
+
+    pub fn event_emitter_handle(&self) -> EventEmitterHandle {
+        self.system_event_emitter.clone()
+    }
+
+    fn sync_task_manager_event_emitter(&self) {
+        self.task_manager
+            .register_event_emitter(self.agent_id.as_deref(), self.system_event_emitter.clone());
+    }
+
+    fn update_main_session_target(&mut self, msg: &InboundMessage) {
+        if !is_main_session_candidate(msg) {
+            return;
+        }
+
+        self.main_session_target = Some(MainSessionTarget {
+            channel: msg.channel.clone(),
+            account_id: msg.account_id.clone(),
+            chat_id: msg.chat_id.clone(),
+            session_key: msg.session_key(),
+        });
+    }
+
+    fn resolve_event_delivery_target(&self, scope: &EventScope) -> Option<MainSessionTarget> {
+        match scope {
+            EventScope::Channel { channel, chat_id } => Some(MainSessionTarget {
+                channel: channel.clone(),
+                account_id: None,
+                chat_id: chat_id.clone(),
+                session_key: format!("{}:{}", channel, chat_id),
+            }),
+            EventScope::Session {
+                channel,
+                chat_id,
+                session_key,
+            } => Some(MainSessionTarget {
+                channel: channel.clone(),
+                account_id: None,
+                chat_id: chat_id.clone(),
+                session_key: session_key.clone(),
+            }),
+            EventScope::MainSession | EventScope::Global => self.main_session_target.clone(),
+        }
+    }
+
+    async fn dispatch_system_event_notification(&self, request: &NotificationRequest) {
+        let target = self.resolve_event_delivery_target(&request.scope);
+        let target_channel = target.as_ref().map(|value| value.channel.clone());
+        let target_chat_id = target.as_ref().map(|value| value.chat_id.clone());
+
+        if let Some(ref event_tx) = self.event_tx {
+            let event = serde_json::json!({
+                "type": "system_event_notification",
+                "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                "event_id": request.event_id.clone(),
+                "priority": request.priority,
+                "title": request.title.clone(),
+                "body": request.body.clone(),
+                "channel": target_channel,
+                "chat_id": target_chat_id,
+            });
+            let _ = event_tx.send(event.to_string());
+        }
+
+        if let Some(target) = target {
+            if target.channel == "ws" {
+                return;
+            }
+            if let Some(tx) = &self.outbound_tx {
+                let mut outbound = OutboundMessage::new(
+                    &target.channel,
+                    &target.chat_id,
+                    &render_system_notification_text(request),
+                );
+                outbound.account_id = target.account_id.clone();
+                let _ = tx.send(outbound).await;
+            }
+        }
+    }
+
+    async fn dispatch_system_event_summary(&self, summary: &SessionSummary) {
+        let target = self.main_session_target.clone();
+        let target_channel = target.as_ref().map(|value| value.channel.clone());
+        let target_chat_id = target.as_ref().map(|value| value.chat_id.clone());
+
+        if let Some(ref event_tx) = self.event_tx {
+            let event = serde_json::json!({
+                "type": "system_event_summary",
+                "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                "channel": target_channel,
+                "chat_id": target_chat_id,
+                "title": summary.title.clone(),
+                "compact_text": summary.compact_text.clone(),
+                "items": summary.items.clone(),
+            });
+            let _ = event_tx.send(event.to_string());
+        }
+
+        if let Some(target) = target {
+            if target.channel == "ws" {
+                return;
+            }
+            if let Some(tx) = &self.outbound_tx {
+                let mut outbound = OutboundMessage::new(
+                    &target.channel,
+                    &target.chat_id,
+                    &render_session_summary_text(summary),
+                );
+                outbound.account_id = target.account_id.clone();
+                let _ = tx.send(outbound).await;
+            }
+        }
+    }
+
+    async fn process_system_event_tick(&self, now_ms: i64) -> HeartbeatDecision {
+        let decision = self.system_event_orchestrator.process_tick(now_ms);
+
+        for request in &decision.immediate_notifications {
+            self.dispatch_system_event_notification(request).await;
+        }
+
+        for summary in &decision.flushed_summaries {
+            self.dispatch_system_event_summary(summary).await;
+        }
+
+        let _ = self.system_event_store.cleanup_expired(7 * 24 * 60 * 60);
+
+        decision
     }
 
     pub fn validate_intent_router(&self) -> Result<()> {
@@ -1070,6 +1292,7 @@ impl AgentRuntime {
     pub async fn process_message(&mut self, msg: InboundMessage) -> Result<String> {
         let session_key = msg.session_key();
         info!(session_key = %session_key, "Processing message");
+        self.update_main_session_target(&msg);
 
         // ── Record sender as a known channel contact (for cross-channel lookup) ──
         if msg.channel != "ws" && msg.channel != "cli" && msg.channel != "system" {
@@ -2232,6 +2455,7 @@ impl AgentRuntime {
             outbound_tx: self.outbound_tx.clone(),
             provider_pool: Arc::clone(&self.provider_pool),
             agent_id: resolve_routed_agent_id(&msg.metadata).or_else(|| self.agent_id.clone()),
+            event_emitter: self.system_event_emitter.clone(),
         });
 
         let ctx = blockcell_tools::ToolContext {
@@ -2249,6 +2473,7 @@ impl AgentRuntime {
             spawn_handle: Some(spawn_handle),
             capability_registry: self.capability_registry.clone(),
             core_evolution: self.core_evolution.clone(),
+            event_emitter: Some(self.system_event_emitter.clone()),
             channel_contacts_file: Some(self.paths.channel_contacts_file()),
         };
 
@@ -2487,6 +2712,7 @@ impl AgentRuntime {
         let outbound_tx = self.outbound_tx.clone();
         let capability_registry = self.capability_registry.clone();
         let core_evolution = self.core_evolution.clone();
+        let event_emitter = self.system_event_emitter.clone();
 
         let tool_executor =
             move |tool_name: &str, params: serde_json::Value| -> Result<serde_json::Value> {
@@ -2560,6 +2786,7 @@ impl AgentRuntime {
                     spawn_handle: None, // No spawning from cron skill scripts
                     capability_registry: capability_registry.clone(),
                     core_evolution: core_evolution.clone(),
+                    event_emitter: Some(event_emitter.clone()),
                     channel_contacts_file: Some(paths.channel_contacts_file()),
                 };
 
@@ -2824,6 +3051,8 @@ impl AgentRuntime {
                                 continue;
                             }
 
+                            self.update_main_session_target(&msg);
+
                             // Spawn each message as a background task so the loop
                             // stays responsive for new user input.
                             let task_id = format!("msg_{}", uuid::Uuid::new_v4());
@@ -2842,6 +3071,8 @@ impl AgentRuntime {
                             let capability_registry = self.capability_registry.clone();
                             let core_evolution = self.core_evolution.clone();
                             let event_tx = self.event_tx.clone();
+                            let agent_id = self.agent_id.clone();
+                            let event_emitter = self.system_event_emitter.clone();
                             let tool_registry = self.tool_registry.clone();
                             let task_id_clone = task_id.clone();
                             let provider_pool = Arc::clone(&self.provider_pool);
@@ -2858,6 +3089,7 @@ impl AgentRuntime {
                                 &msg.channel,
                                 &msg.chat_id,
                                 self.agent_id.as_deref(),
+                                false,
                             ).await;
 
                             if let Some(prev_task_id) = active_chat_tasks.remove(&chat_id_for_task) {
@@ -2886,6 +3118,8 @@ impl AgentRuntime {
                                     capability_registry,
                                     core_evolution,
                                     event_tx,
+                                    agent_id,
+                                    event_emitter,
                                     msg,
                                     task_id_clone,
                                 ).await;
@@ -2908,6 +3142,10 @@ impl AgentRuntime {
                             warn!(error = %e, "Memory maintenance error");
                         }
                     }
+
+                    let _ = self
+                        .process_system_event_tick(chrono::Utc::now().timestamp_millis())
+                        .await;
 
                     // Evolution rollout tick
                     if has_evolution {
@@ -3024,6 +3262,8 @@ async fn run_message_task(
     capability_registry: Option<CapabilityRegistryHandle>,
     core_evolution: Option<CoreEvolutionHandle>,
     event_tx: Option<broadcast::Sender<String>>,
+    agent_id: Option<String>,
+    event_emitter: EventEmitterHandle,
     msg: InboundMessage,
     task_id: String,
 ) {
@@ -3051,6 +3291,8 @@ async fn run_message_task(
         runtime.set_confirm(tx);
     }
     runtime.set_task_manager(task_manager.clone());
+    runtime.set_agent_id(agent_id);
+    runtime.set_event_emitter(event_emitter);
     if let Some(store) = memory_store {
         runtime.set_memory_store(store);
     }
@@ -3095,6 +3337,7 @@ async fn run_subagent_task(
     origin_channel: String,
     origin_chat_id: String,
     agent_id: Option<String>,
+    event_emitter: EventEmitterHandle,
 ) {
     // Create the task entry first, then immediately mark it running.
     // This ensures set_running() never operates on a non-existent task ID.
@@ -3106,6 +3349,7 @@ async fn run_subagent_task(
             &origin_channel,
             &origin_chat_id,
             agent_id.as_deref(),
+            true,
         )
         .await;
     task_manager.set_running(&task_id).await;
@@ -3122,6 +3366,7 @@ async fn run_subagent_task(
     };
     sub_runtime.set_task_manager(task_manager.clone());
     sub_runtime.set_agent_id(agent_id.clone());
+    sub_runtime.set_event_emitter(event_emitter);
 
     // Create a unique session key for this subagent
     let session_key = format!("subagent:{}", task_id);
@@ -3400,6 +3645,167 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn test_tool_context_supports_optional_event_emitter() {
+        use blockcell_core::system_event::{EventPriority, SystemEvent};
+        use blockcell_tools::{SystemEventEmitter, ToolContext};
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        struct NoopEmitter;
+
+        impl SystemEventEmitter for NoopEmitter {
+            fn emit(&self, _event: SystemEvent) {}
+
+            fn emit_simple(
+                &self,
+                kind: &str,
+                source: &str,
+                priority: EventPriority,
+                title: &str,
+                summary: &str,
+            ) {
+                let _ = SystemEvent::new_main_session(kind, source, priority, title, summary);
+            }
+        }
+
+        let ctx = ToolContext {
+            workspace: PathBuf::from("/tmp/workspace"),
+            builtin_skills_dir: None,
+            session_key: "cli:test".to_string(),
+            channel: "cli".to_string(),
+            account_id: None,
+            chat_id: "chat-1".to_string(),
+            config: Config::default(),
+            permissions: blockcell_core::types::PermissionSet::new(),
+            task_manager: None,
+            memory_store: None,
+            outbound_tx: None,
+            spawn_handle: None,
+            capability_registry: None,
+            core_evolution: None,
+            event_emitter: Some(Arc::new(NoopEmitter)),
+            channel_contacts_file: None,
+        };
+
+        assert!(ctx.event_emitter.is_some());
+    }
+
+    fn test_runtime() -> AgentRuntime {
+        let mut config = Config::default();
+        config.agents.defaults.model = "ollama/llama3".to_string();
+        config.agents.defaults.provider = Some("ollama".to_string());
+
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-system-event-runtime-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp runtime dir");
+        let paths = Paths::with_base(base);
+        let provider_pool =
+            blockcell_providers::ProviderPool::from_config(&config).expect("build provider pool");
+
+        let mut runtime = AgentRuntime::new(
+            config,
+            paths,
+            provider_pool,
+            blockcell_tools::ToolRegistry::new(),
+        )
+        .expect("create runtime");
+        runtime.set_agent_id(Some("default".to_string()));
+        runtime
+    }
+
+    fn test_main_session_inbound(channel: &str, chat_id: &str) -> InboundMessage {
+        InboundMessage {
+            channel: channel.to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: chat_id.to_string(),
+            content: "hello".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_tick_emits_event_tx_for_immediate_notifications() {
+        let mut runtime = test_runtime();
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        runtime.set_event_tx(event_tx);
+        runtime.update_main_session_target(&test_main_session_inbound("cli", "chat-1"));
+
+        let mut event = SystemEvent::new_main_session(
+            "task.failed",
+            "task_manager",
+            EventPriority::Critical,
+            "Task failed",
+            "Background report failed",
+        );
+        event.delivery.immediate = true;
+        runtime.event_emitter_handle().emit(event);
+
+        let decision = runtime
+            .process_system_event_tick(chrono::Utc::now().timestamp_millis())
+            .await;
+
+        assert_eq!(decision.immediate_notifications.len(), 1);
+        let payload = event_rx.recv().await.expect("receive ws event");
+        let json: serde_json::Value = serde_json::from_str(&payload).expect("parse ws event");
+        assert_eq!(json["type"], "system_event_notification");
+        assert_eq!(json["chat_id"], "chat-1");
+        assert_eq!(json["title"], "Task failed");
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_tick_flushes_summary_to_main_session_outbound() {
+        let mut runtime = test_runtime();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
+        runtime.set_outbound(outbound_tx);
+        runtime.update_main_session_target(&test_main_session_inbound("cli", "chat-1"));
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut event = SystemEvent::new_main_session(
+            "task.completed",
+            "task_manager",
+            EventPriority::Normal,
+            "Report ready",
+            "Background report finished",
+        );
+        event.created_at_ms = now_ms - 60_000;
+        runtime.event_emitter_handle().emit(event);
+
+        let decision = runtime.process_system_event_tick(now_ms).await;
+
+        assert_eq!(decision.flushed_summaries.len(), 1);
+        let outbound = outbound_rx.recv().await.expect("receive outbound summary");
+        assert_eq!(outbound.channel, "cli");
+        assert_eq!(outbound.chat_id, "chat-1");
+        assert!(outbound.content.contains("Report ready"));
+        assert!(outbound.content.contains("System updates") || outbound.content.contains("🗂️"));
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_tick_gracefully_handles_missing_dispatchers() {
+        let runtime = test_runtime();
+
+        let event = SystemEvent::new_main_session(
+            "task.failed",
+            "task_manager",
+            EventPriority::Critical,
+            "Task failed",
+            "No dispatcher configured",
+        );
+        runtime.event_emitter_handle().emit(event);
+
+        let decision = runtime
+            .process_system_event_tick(chrono::Utc::now().timestamp_millis())
+            .await;
+
+        assert_eq!(decision.immediate_notifications.len(), 1);
     }
 
     #[test]

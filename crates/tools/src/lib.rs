@@ -39,6 +39,7 @@ pub mod video_process;
 pub mod web;
 
 use async_trait::async_trait;
+use blockcell_core::system_event::{EventPriority, SystemEvent};
 use blockcell_core::types::PermissionSet;
 use blockcell_core::{Config, OutboundMessage, Result};
 use serde_json::Value;
@@ -94,6 +95,27 @@ pub type CapabilityRegistryHandle = Arc<Mutex<dyn CapabilityRegistryOps + Send +
 
 /// Opaque handle to the core evolution engine, passed through ToolContext.
 pub type CoreEvolutionHandle = Arc<Mutex<dyn CoreEvolutionOps + Send + Sync>>;
+
+/// Opaque handle to the system event emitter, passed through ToolContext.
+pub type EventEmitterHandle = Arc<dyn SystemEventEmitter + Send + Sync>;
+
+/// Trait abstracting system event emission needed by tools and runtime services.
+pub trait SystemEventEmitter: Send + Sync {
+    fn emit(&self, event: SystemEvent);
+
+    fn emit_simple(
+        &self,
+        kind: &str,
+        source: &str,
+        priority: EventPriority,
+        title: &str,
+        summary: &str,
+    ) {
+        self.emit(SystemEvent::new_main_session(
+            kind, source, priority, title, summary,
+        ));
+    }
+}
 
 /// Trait abstracting capability registry operations needed by tools.
 #[async_trait]
@@ -183,6 +205,7 @@ pub struct ToolContext {
     pub spawn_handle: Option<Arc<dyn SpawnHandle>>,
     pub capability_registry: Option<CapabilityRegistryHandle>,
     pub core_evolution: Option<CoreEvolutionHandle>,
+    pub event_emitter: Option<EventEmitterHandle>,
     /// Path to channel_contacts.json for cross-channel contact lookup.
     pub channel_contacts_file: Option<PathBuf>,
 }
