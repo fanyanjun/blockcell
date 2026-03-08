@@ -13,6 +13,11 @@
 
 如果用户只说"拍张照"，**不需要询问**，直接使用默认参数拍照。
 
+## 输入约定
+- 优先接收结构化 JSON 输入，例如 `{"device":0,"format":"jpg","output_path":"~/Desktop/photo.jpg"}`
+- `SKILL.rhai` 会优先从 `ctx.message` 解析 JSON
+- 若不是 JSON，则回退为默认参数拍照
+
 ## 工具调用顺序
 1. `camera_capture(action="info")` — 获取摄像头信息和可用拍摄方式（仅首次或用户询问时）
 2. `camera_capture(action="list")` — 列出可用摄像头（仅用户需要选择时）
